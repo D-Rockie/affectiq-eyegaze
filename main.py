@@ -2,174 +2,222 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import time
+import math
+import os
+import urllib.request
+import shutil
+import subprocess
+
+def download_model_if_missing(model_path):
+    if os.path.exists(model_path):
+        return
+    print(f"Downloading MediaPipe Face Landmarker model to {model_path}...")
+    url = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+    os.makedirs(os.path.dirname(os.path.abspath(model_path)), exist_ok=True)
+    try:
+        urllib.request.urlretrieve(url, model_path)
+        print("Download complete.")
+    except Exception as e:
+        print(f"Download failed via urllib: {e}")
+        if os.path.exists(model_path):
+            os.unlink(model_path)
+        # Fall back to curl
+        if shutil.which("curl") is not None:
+            print("Retrying download using system curl...")
+            try:
+                subprocess.run(["curl", "-fL", "-o", model_path, url], check=True)
+                print("Download complete via curl.")
+                return
+            except Exception as e2:
+                print(f"Download failed via curl: {e2}")
+                if os.path.exists(model_path):
+                    os.unlink(model_path)
+        raise RuntimeError(
+            f"Could not download model file. Please download it manually from:\n"
+            f"  {url}\n"
+            f"and place it at:\n"
+            f"  {os.path.abspath(model_path)}"
+        )
 
 
-class FeatureSmoother:
-    def __init__(self, size=5):
-        self.size = size
-        self.history = []
-
-    def add_and_smooth(self, feats):
-        # feats is a tuple: (lh, lv, rh, rv, tx, ty, dist, yaw, pitch)
-        self.history.append(feats)
-        if len(self.history) > self.size:
-            self.history.pop(0)
-        arr = np.array(self.history)
-        return tuple(np.mean(arr, axis=0))
+class OneEuroFilter:
+    def __init__(self, min_cutoff=1.0, beta=0.05, d_cutoff=1.0):
+        self._min_cutoff = float(min_cutoff)
+        self._beta = float(beta)
+        self._d_cutoff = float(d_cutoff)
+        self._x_prev = None
+        self._dx_prev = 0.0
+        self._t_prev = None
 
     def reset(self):
-        self.history = []
+        self._x_prev = None
+        self._dx_prev = 0.0
+        self._t_prev = None
+
+    @staticmethod
+    def _smoothing_alpha(cutoff_hz, dt_s):
+        tau = 1.0 / (2.0 * math.pi * cutoff_hz)
+        return 1.0 / (1.0 + tau / dt_s)
+
+    def filter(self, x, t_s):
+        if not math.isfinite(x):
+            return float(self._x_prev) if self._x_prev is not None else float(x)
+
+        if self._x_prev is None or self._t_prev is None:
+            self._x_prev = float(x)
+            self._t_prev = float(t_s)
+            return float(x)
+
+        dt = float(t_s) - self._t_prev
+        if dt <= 0:
+            return float(self._x_prev)
+
+        dx = (x - self._x_prev) / dt
+        alpha_d = self._smoothing_alpha(self._d_cutoff, dt)
+        dx_smooth = alpha_d * dx + (1.0 - alpha_d) * self._dx_prev
+
+        cutoff = self._min_cutoff + self._beta * abs(dx_smooth)
+        alpha = self._smoothing_alpha(cutoff, dt)
+
+        x_smooth = alpha * x + (1.0 - alpha) * self._x_prev
+
+        self._x_prev = float(x_smooth)
+        self._dx_prev = float(dx_smooth)
+        self._t_prev = float(t_s)
+
+        return float(x_smooth)
+
+
+class OneEuro2D:
+    def __init__(self, min_cutoff=1.0, beta=0.05, d_cutoff=1.0):
+        self._fx = OneEuroFilter(min_cutoff, beta, d_cutoff)
+        self._fy = OneEuroFilter(min_cutoff, beta, d_cutoff)
+
+    def reset(self):
+        self._fx.reset()
+        self._fy.reset()
+
+    def filter(self, x, y, t_s):
+        return self._fx.filter(x, t_s), self._fy.filter(y, t_s)
 
 
 
 
-def get_gaze_direction(ratio):
-
-    if ratio < 0.35:
-        return "RIGHT"
-
-    elif ratio > 0.65:
-        return "LEFT"
-
-    else:
-        return "CENTER"
-
-def get_vertical_direction(vertical_ratio):
-
-    if vertical_ratio < 0.35:
-        return "UP"
-
-    elif vertical_ratio > 0.65:
-        return "DOWN"
-
-    else:
-        return "CENTER"
-
-
-def get_iris_center(face_landmarks, iris_indices, w, h):
-
-    points = []
-
-    for idx in iris_indices:
-
-        landmark = face_landmarks.landmark[idx]
-
-        x = int(landmark.x * w)
-        y = int(landmark.y * h)
-
-        points.append((x, y))
-
-    center_x = sum(p[0] for p in points) / len(points)
-    center_y = sum(p[1] for p in points) / len(points)
-
-    return int(center_x), int(center_y)
-
-def calculate_iris_ratio(iris_x, c1_x, c2_x, eye_width):
-    if eye_width == 0:
-        return 0
-    return (iris_x - min(c1_x, c2_x)) / eye_width
-
-def calculate_vertical_ratio(iris_y, c1_y, c2_y, eye_width):
-    if eye_width == 0:
-        return 0
-    baseline_y = (c1_y + c2_y) / 2.0
-    return (iris_y - baseline_y) / eye_width
+def features_from_landmarks(landmarks, yaw, pitch, roll):
+    # Left eye: outer is 263, inner is 362
+    left_outer = (landmarks[263].x, landmarks[263].y)
+    left_inner = (landmarks[362].x, landmarks[362].y)
+    left_center = ((left_outer[0] + left_inner[0]) / 2.0, (left_outer[1] + left_inner[1]) / 2.0)
+    
+    # Right eye: outer is 33, inner is 133
+    right_outer = (landmarks[33].x, landmarks[33].y)
+    right_inner = (landmarks[133].x, landmarks[133].y)
+    right_center = ((right_outer[0] + right_inner[0]) / 2.0, (right_outer[1] + right_inner[1]) / 2.0)
+    
+    # Left iris center is 473, right iris center is 468
+    left_iris = (landmarks[473].x, landmarks[473].y)
+    right_iris = (landmarks[468].x, landmarks[468].y)
+    
+    # Offsets in normalized coordinates
+    left_iris_offset_x = left_iris[0] - left_center[0]
+    left_iris_offset_y = left_iris[1] - left_center[1]
+    right_iris_offset_x = right_iris[0] - right_center[0]
+    right_iris_offset_y = right_iris[1] - right_center[1]
+    
+    return np.array([
+        left_iris_offset_x,
+        left_iris_offset_y,
+        right_iris_offset_x,
+        right_iris_offset_y,
+        float(yaw),
+        float(pitch),
+        float(roll)
+    ], dtype=np.float64)
 
 
-def extract_gaze_features(lh, lv, rh, rv, yaw, pitch, dist):
-    """
-    Extracts the 19-dimensional feature vector:
-    - 4 Iris features
-    - 3 Head pose features
-    - 12 Cross-term interaction terms (iris * head)
-    """
-    iris_feats = [lh, lv, rh, rv]
-    head_feats = [yaw, pitch, dist]
-    cross_feats = []
-    for i in iris_feats:
-        for h in head_feats:
-            cross_feats.append(i * h)
-    return np.array(iris_feats + head_feats + cross_feats, dtype=float)
+def expand_features(X):
+    # X can be shape (N, 7) or (7,)
+    is_1d = (X.ndim == 1)
+    if is_1d:
+        X = np.expand_dims(X, axis=0)
+    
+    cols = [X]
+    # Iris indices: 0, 1, 2, 3. Head indices: 4, 5, 6.
+    for i in [0, 1, 2, 3]:
+        for j in [4, 5, 6]:
+            cols.append((X[:, i] * X[:, j]).reshape(-1, 1))
+            
+    expanded = np.hstack(cols)
+    if is_1d:
+        return expanded[0]
+    return expanded
 
 
-def calibrate_gaze(calibration_data, lambda_val=0.01):
-    """
-    Fits Ridge Regression mapping weights using standardized 19-D features.
-    Uses direct augmented-matrix solving for numerical stability and a variance noise-gate.
-    """
+def calibrate_gaze(calibration_data, lambda_val=0.001):
+    # calibration_data is a list of tuples: (tx, ty, l_ox, l_oy, r_ox, r_oy, yaw, pitch, roll)
     if len(calibration_data) < 20:
         return None, None, None, None
-
+        
     X_raw = []
     Y_x = []
     Y_y = []
-
+    
     for item in calibration_data:
-        tx, ty, lh, lv, rh, rv, h_tx, h_ty, h_dist, h_yaw, h_pitch = item
-        X_raw.append(extract_gaze_features(lh, lv, rh, rv, h_yaw, h_pitch, h_dist))
+        tx, ty, l_ox, l_oy, r_ox, r_oy, yaw, pitch, roll = item
+        X_raw.append([l_ox, l_oy, r_ox, r_oy, yaw, pitch, roll])
         Y_x.append(tx)
         Y_y.append(ty)
-
-    X_raw = np.array(X_raw)  # Shape (N, 19)
-    Y_x = np.array(Y_x)      # Shape (N,)
-    Y_y = np.array(Y_y)      # Shape (N,)
-
-    # Feature standardization with a noise-gate threshold
-    means = np.mean(X_raw, axis=0)
-    stds = np.std(X_raw, axis=0)
-    # Threshold at 0.01: do not scale features with very low variance (avoids noise amplification)
-    stds[stds < 0.01] = 1.0  
-
+        
+    X_raw = np.array(X_raw, dtype=np.float64)  # (N, 7)
+    Y_x = np.array(Y_x, dtype=np.float64)
+    Y_y = np.array(Y_y, dtype=np.float64)
+    
+    means = X_raw.mean(axis=0)
+    stds = X_raw.std(axis=0)
+    # Threshold below 1e-9 to prevent divide-by-zero
+    stds = np.where(stds < 1e-9, 1.0, stds)
+    
     X_std = (X_raw - means) / stds
-
-    # Add bias column (all ones)
-    X_std_bias = np.hstack([np.ones((X_std.shape[0], 1)), X_std])  # Shape (N, 20)
-
-    # Use highly stable Augmented Matrix method for Ridge Regression:
-    # We append sqrt(lambda) * I to X, and zeros to Y
-    # The bias column (index 0) has a regularization weight of 0.0
-    reg_weights = np.ones(20) * np.sqrt(lambda_val)
-    reg_weights[0] = 0.0  # Do not regularize the bias term
+    X_expanded = expand_features(X_std)  # (N, 19)
     
-    X_reg = np.diag(reg_weights)  # Shape (20, 20)
+    # Add bias column at the end (shape N, 20)
+    X_aug = np.hstack([X_expanded, np.ones((X_expanded.shape[0], 1))])
     
-    # Augmented X of shape (N + 20, 20)
-    X_aug = np.vstack([X_std_bias, X_reg])
+    # Ridge: do not regularize the bias term (index -1)
+    n_features_aug = X_aug.shape[1]
+    alpha_mat = lambda_val * np.eye(n_features_aug)
+    alpha_mat[-1, -1] = 0.0
     
-    # Augmented Y of shape (N + 20,)
-    Y_x_aug = np.concatenate([Y_x, np.zeros(20)])
-    Y_y_aug = np.concatenate([Y_y, np.zeros(20)])
+    XtX = X_aug.T @ X_aug + alpha_mat
+    
+    try:
+        w_x = np.linalg.solve(XtX, X_aug.T @ Y_x)
+        w_y = np.linalg.solve(XtX, X_aug.T @ Y_y)
+    except np.linalg.LinAlgError:
+        # Fallback to least squares if singular
+        w_x, _, _, _ = np.linalg.lstsq(XtX, X_aug.T @ Y_x, rcond=None)
+        w_y, _, _, _ = np.linalg.lstsq(XtX, X_aug.T @ Y_y, rcond=None)
+        
+    return w_x, w_y, means, stds
 
-    # Solve using standard least-squares (extremely stable)
-    x_weights, _, _, _ = np.linalg.lstsq(X_aug, Y_x_aug, rcond=None)
-    y_weights, _, _, _ = np.linalg.lstsq(X_aug, Y_y_aug, rcond=None)
 
-    return x_weights, y_weights, means, stds
-
-
-def predict_gaze(lh, lv, rh, rv, head_features, x_weights, y_weights, means, stds):
-    """
-    Predicts screen coordinates given current gaze features and standardization maps.
-    """
-    if x_weights is None or y_weights is None or head_features is None or means is None or stds is None:
+def predict_gaze(feats, x_weights, y_weights, means, stds):
+    # feats is a 7-D base features vector
+    if x_weights is None or y_weights is None or means is None or stds is None:
         return None
-
-    # head_features structure: (head_tx, head_ty, head_dist, head_yaw, head_pitch)
-    h_tx, h_ty, h_dist, h_yaw, h_pitch = head_features
-
-    # 1. Extract 19-D features
-    feats = extract_gaze_features(lh, lv, rh, rv, h_yaw, h_pitch, h_dist)
-
-    # 2. Standardize
+        
+    # Standardize base features
     feats_std = (feats - means) / stds
-
-    # 3. Add bias coefficient (1.0)
-    feats_std_bias = np.insert(feats_std, 0, 1.0)
-
-    # 4. Dot product prediction
-    pred_x = np.dot(feats_std_bias, x_weights)
-    pred_y = np.dot(feats_std_bias, y_weights)
-
+    
+    # Expand to 19-D
+    feats_expanded = expand_features(feats_std)
+    
+    # Add bias term (1.0) at the end to match w_x, w_y
+    feats_aug = np.append(feats_expanded, 1.0)
+    
+    pred_x = np.dot(feats_aug, x_weights)
+    pred_y = np.dot(feats_aug, y_weights)
+    
     return int(pred_x), int(pred_y)
 
 cap = cv2.VideoCapture(0)
@@ -191,15 +239,23 @@ else:
     screen_w, screen_h = 1920, 1080  # Default fallback
 print(f"Native Screen Resolution: {screen_w}x{screen_h}")
 
-mp_face_mesh = mp.solutions.face_mesh
+from mediapipe.tasks.python import BaseOptions
+from mediapipe.tasks.python import vision as mp_vision
 
-face_mesh = mp_face_mesh.FaceMesh(
-    max_num_faces=1,
-    refine_landmarks=True
+model_path = "face_landmarker_v2_with_blendshapes.task"
+download_model_if_missing(model_path)
+
+options = mp_vision.FaceLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path=model_path),
+    running_mode=mp_vision.RunningMode.IMAGE,
+    num_faces=1,
+    min_face_detection_confidence=0.5,
+    min_face_presence_confidence=0.5,
+    min_tracking_confidence=0.5,
+    output_face_blendshapes=False,
+    output_facial_transformation_matrixes=True,
 )
-
-LEFT_IRIS = [474, 475, 476, 477]
-RIGHT_IRIS = [469, 470, 471, 472]
+landmarker = mp_vision.FaceLandmarker.create_from_options(options)
 
 # Calibration states
 STATE_PREVIEW = 0
@@ -209,7 +265,7 @@ STATE_CALIBRATED = 3
 
 current_state = STATE_PREVIEW
 active_point_idx = 0
-calibration_data = []  # Stores: (target_x, target_y, lh, lv, rh, rv, tx, ty, dist, yaw, pitch)
+calibration_data = []  # Stores: (target_x, target_y, left_x, left_y, right_x, right_y, yaw, pitch, roll)
 
 # Ridge coefficients & standardization weights
 x_weights = None
@@ -217,14 +273,12 @@ y_weights = None
 means = None
 stds = None
 
-gaze_history = []
-HISTORY_SIZE = 6  # Size of smoothing history window
+gaze_filter = OneEuro2D(min_cutoff=1.0, beta=0.05)
 point_start_time = 0.0
 point_running = False
 point_captured_duration = 0.0
 last_time = time.time()
-latest_head_features = None
-input_smoother = FeatureSmoother(size=5)
+latest_features = None  # Stores: np.array([left_x, left_y, right_x, right_y, yaw, pitch, roll])
 
 # Compute 9 calibration points dynamically for screen size (10%, 50%, 90% scaling)
 margin_x = int(screen_w * 0.1)
@@ -250,191 +304,71 @@ while True:
     last_time = current_time
 
     success, frame = cap.read()
-
     if not success:
         break
 
-    latest_lh_ratio = None
-    latest_lv_ratio = None
-    latest_rh_ratio = None
-    latest_rv_ratio = None
-    latest_head_features = None
+    latest_features = None
 
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+    result = landmarker.detect(mp_image)
 
-    results = face_mesh.process(rgb)
+    if result.face_landmarks:
+        for face_landmarks in result.face_landmarks:
+            h, w, _ = frame.shape
 
-    if results.multi_face_landmarks:
-        for face_landmarks in results.multi_face_landmarks:
-                h, w, _ = frame.shape
+            # Eyelids index: Left top lid: 159, Left bottom lid: 145. Corners: Outer 263, Inner 362.
+            # Right top lid: 386, Right bottom lid: 374. Corners: Outer 33, Inner 133.
+            left_eye_h = abs(face_landmarks[159].y - face_landmarks[145].y)
+            left_eye_w = math.sqrt((face_landmarks[263].x - face_landmarks[362].x)**2 + (face_landmarks[263].y - face_landmarks[362].y)**2)
+            left_ear = left_eye_h / left_eye_w if left_eye_w > 0 else 0.0
 
-                # Calculate Head Pose Correction Features
-                head_tx = face_landmarks.landmark[1].x
-                head_ty = face_landmarks.landmark[1].y
-                
-                # Eye-corner span Euclidean distance for Z-depth
-                dx = face_landmarks.landmark[263].x - face_landmarks.landmark[33].x
-                dy = face_landmarks.landmark[263].y - face_landmarks.landmark[33].y
-                dz = face_landmarks.landmark[263].z - face_landmarks.landmark[33].z
-                head_dist = (dx**2 + dy**2 + dz**2)**0.5
-                
-                # Yaw horizontal ratio (nose tip relative to outer eye corners)
-                head_yaw = (face_landmarks.landmark[1].x - face_landmarks.landmark[33].x) / (face_landmarks.landmark[263].x - face_landmarks.landmark[33].x + 1e-6)
-                
-                # Pitch vertical ratio (nose tip relative to forehead & chin)
-                head_pitch = (face_landmarks.landmark[1].y - face_landmarks.landmark[10].y) / (face_landmarks.landmark[152].y - face_landmarks.landmark[10].y + 1e-6)
-                
-                
-                left_center = get_iris_center(
-                    face_landmarks,
-                    LEFT_IRIS,
-                    w,
-                    h
-                )
+            right_eye_h = abs(face_landmarks[386].y - face_landmarks[374].y)
+            right_eye_w = math.sqrt((face_landmarks[33].x - face_landmarks[133].x)**2 + (face_landmarks[33].y - face_landmarks[133].y)**2)
+            right_ear = right_eye_h / right_eye_w if right_eye_w > 0 else 0.0
 
-                right_center = get_iris_center(
-                    face_landmarks,
-                    RIGHT_IRIS,
-                    w,
-                    h
-                )
+            # Only process features if eyes are open (blink gate)
+            if left_ear >= 0.15 and right_ear >= 0.15:
+                # Decompose rigid transform matrix into yaw, pitch, roll
+                yaw, pitch, roll = 0.0, 0.0, 0.0
+                if result.facial_transformation_matrixes:
+                    mat = np.asarray(result.facial_transformation_matrixes[0], dtype=np.float64)
+                    if mat.shape == (4, 4):
+                        r = mat[:3, :3]
+                        pitch = math.degrees(math.asin(max(-1.0, min(1.0, -r[1, 2]))))
+                        yaw = math.degrees(math.atan2(r[0, 2], r[2, 2]))
+                        roll = math.degrees(math.atan2(r[1, 0], r[1, 1]))
 
-                cv2.circle(
-                    frame,
-                    left_center,
-                    6,
-                    (255, 0, 0),
-                    -1
-                )
+                latest_features = features_from_landmarks(face_landmarks, yaw, pitch, roll)
 
-                cv2.circle(
-                    frame,
-                    right_center,
-                    6,
-                    (255, 0, 0),
-                    -1
-                )
+            # Draw iris and eye corner overlays on the PiP frame
+            h_f, w_f, _ = frame.shape
+            left_center_px = (int(face_landmarks[473].x * w_f), int(face_landmarks[473].y * h_f))
+            right_center_px = (int(face_landmarks[468].x * w_f), int(face_landmarks[468].y * h_f))
+            cv2.circle(frame, left_center_px, 6, (255, 0, 0), -1)
+            cv2.circle(frame, right_center_px, 6, (255, 0, 0), -1)
 
-                # Left eye
-                left_iris_x = left_center[0]
-                left_iris_y = left_center[1]
+            # Draw outer/inner corners lines
+            left_c1_px = (int(face_landmarks[362].x * w_f), int(face_landmarks[362].y * h_f))
+            left_c2_px = (int(face_landmarks[263].x * w_f), int(face_landmarks[263].y * h_f))
+            cv2.line(frame, left_c1_px, left_c2_px, (0, 255, 0), 1)
 
-                left_c1_x = int(face_landmarks.landmark[362].x * w)
-                left_c1_y = int(face_landmarks.landmark[362].y * h)
-                left_c2_x = int(face_landmarks.landmark[263].x * w)
-                left_c2_y = int(face_landmarks.landmark[263].y * h)
+            right_c1_px = (int(face_landmarks[33].x * w_f), int(face_landmarks[33].y * h_f))
+            right_c2_px = (int(face_landmarks[133].x * w_f), int(face_landmarks[133].y * h_f))
+            cv2.line(frame, right_c1_px, right_c2_px, (0, 255, 0), 1)
 
-                left_eye_w_dist = ((left_c2_x - left_c1_x)**2 + (left_c2_y - left_c1_y)**2)**0.5
-
-                left_ratio = calculate_iris_ratio(left_iris_x, left_c1_x, left_c2_x, left_eye_w_dist)
-
-                top_lid_y = int(face_landmarks.landmark[159].y * h)
-                bottom_lid_y = int(face_landmarks.landmark[145].y * h)
-
-                left_vertical_ratio = calculate_vertical_ratio(left_iris_y, left_c1_y, left_c2_y, left_eye_w_dist)
-
-
-                # Right eye
-                right_iris_x = right_center[0]
-                right_iris_y = right_center[1]
-
-                right_c1_x = int(face_landmarks.landmark[33].x * w)
-                right_c1_y = int(face_landmarks.landmark[33].y * h)
-                right_c2_x = int(face_landmarks.landmark[133].x * w)
-                right_c2_y = int(face_landmarks.landmark[133].y * h)
-
-                right_eye_w_dist = ((right_c2_x - right_c1_x)**2 + (right_c2_y - right_c1_y)**2)**0.5
-
-                right_ratio = calculate_iris_ratio(right_iris_x, right_c1_x, right_c2_x, right_eye_w_dist)
-
-                right_top_lid_y = int(face_landmarks.landmark[386].y * h)
-                right_bottom_lid_y = int(face_landmarks.landmark[374].y * h)
-
-                right_vertical_ratio = calculate_vertical_ratio(right_iris_y, right_c1_y, right_c2_y, right_eye_w_dist)
-                
-                #Average horizontal ratio
-                avg_ratio = (
-                    left_ratio +
-                    right_ratio
-                ) / 2
-                
-                #Average vertical ratio
-                avg_vertical_ratio = (
-                    left_vertical_ratio +
-                    right_vertical_ratio
-                ) / 2
-
-                # Calculate Eye Aspect Ratio (EAR) for blink detection
-                left_eye_h = abs(top_lid_y - bottom_lid_y)
-                left_eye_w = abs(left_c2_x - left_c1_x)
-                left_ear = left_eye_h / left_eye_w if left_eye_w > 0 else 0.0
-
-                right_eye_h = abs(right_top_lid_y - right_bottom_lid_y)
-                right_eye_w = abs(right_c2_x - right_c1_x)
-                right_ear = right_eye_h / right_eye_w if right_eye_w > 0 else 0.0
-
-                # Blink gate: only record and smooth features if both eyes are open
-                if left_ear >= 0.18 and right_ear >= 0.18:
-                    raw_feats = (left_ratio, left_vertical_ratio, right_ratio, right_vertical_ratio,
-                                 head_tx, head_ty, head_dist, head_yaw, head_pitch)
-                    sm_feats = input_smoother.add_and_smooth(raw_feats)
-                    
-                    latest_lh_ratio, latest_lv_ratio, latest_rh_ratio, latest_rv_ratio, sm_tx, sm_ty, sm_dist, sm_yaw, sm_pitch = sm_feats
-                    latest_head_features = (sm_tx, sm_ty, sm_dist, sm_yaw, sm_pitch)
-
-                direction = get_gaze_direction(
-                    avg_ratio
-                )
-
-                if direction == "LEFT":
-                    color = (0, 0, 255)      # Red
-
-                elif direction == "RIGHT":
-                    color = (255, 0, 0)      # Blue
-
-                else:
-                    color = (0, 255, 0)      # Green
-
-
-                vertical_direction = get_vertical_direction(
-                    avg_vertical_ratio
-                )
-
-                if vertical_direction == "CENTER":
-
-                    final_direction = direction
-
-                else:
-
-                    final_direction = (
-                        vertical_direction +
-                        " " +
-                        direction
-                    )
-
-
+            # Draw head pose degrees
+            if 'yaw' in locals():
                 cv2.putText(
                     frame,
-                    final_direction,
-                    (50, 50),
+                    f"Yaw:{yaw:+.1f} Pitch:{pitch:+.1f} Roll:{roll:+.1f}",
+                    (30, 50),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    1,
-                    color,
-                    2
+                    0.7,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA
                 )
-
-                print(
-                    f"H:{avg_ratio:.2f} "
-                    f"V:{avg_vertical_ratio:.2f} "
-                    f"{final_direction}"
-                )
-
-                for idx in LEFT_IRIS + RIGHT_IRIS:
-                    landmark = face_landmarks.landmark[idx]
-                    x = int(landmark.x * frame.shape[1])
-                    y = int(landmark.y * frame.shape[0])
-
-                    cv2.circle(frame, (x, y), 3, (0, 0, 255), -1)
 
     # Construct fullscreen visualization canvas
     canvas_w, canvas_h = screen_w, screen_h
@@ -458,7 +392,7 @@ while True:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (220, 220, 220), 2, cv2.LINE_AA)
 
     elif current_state == STATE_CALIB_STATIONARY:
-        is_tracking_active = (latest_lh_ratio is not None and latest_head_features is not None)
+        is_tracking_active = (latest_features is not None)
 
         if not point_running:
             # Waiting for SPACE key
@@ -510,13 +444,13 @@ while True:
                         sweep_angle = int(sweep_ratio * 360)
                         cv2.ellipse(canvas, pt, (24, 24), 0, -90, -90 + sweep_angle, target_color, 2, cv2.LINE_AA)
 
-                        # Continuously log data points
-                        if is_tracking_active:
-                            h_tx, h_ty, h_dist, h_yaw, h_pitch = latest_head_features
+                        # Continuously log data points after 1.5s settle-down delay
+                        if is_tracking_active and point_captured_duration >= 1.5:
                             calibration_data.append((
                                 pt[0], pt[1], 
-                                latest_lh_ratio, latest_lv_ratio, latest_rh_ratio, latest_rv_ratio,
-                                h_tx, h_ty, h_dist, h_yaw, h_pitch
+                                latest_features[0], latest_features[1],
+                                latest_features[2], latest_features[3],
+                                latest_features[4], latest_features[5], latest_features[6]
                             ))
                     else:
                         # Faint uncalibrated points
@@ -529,7 +463,7 @@ while True:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (220, 220, 220), 2, cv2.LINE_AA)
 
     elif current_state == STATE_CALIB_SHAKING:
-        is_tracking_active = (latest_lh_ratio is not None and latest_head_features is not None)
+        is_tracking_active = (latest_features is not None)
 
         if not point_running:
             # Waiting for SPACE key
@@ -568,7 +502,7 @@ while True:
                     # Run the 19-parameter Ridge Regression solver
                     x_weights, y_weights, means, stds = calibrate_gaze(calibration_data)
                     current_state = STATE_CALIBRATED
-                    gaze_history = []
+                    gaze_filter.reset()
                     print(f"Calibration completed. Collected {len(calibration_data)} frames.")
             else:
                 # Render 9-point layout
@@ -582,13 +516,13 @@ while True:
                         sweep_angle = int(sweep_ratio * 360)
                         cv2.ellipse(canvas, pt, (24, 24), 0, -90, -90 + sweep_angle, target_color, 2, cv2.LINE_AA)
 
-                        # Continuously log data points
-                        if is_tracking_active:
-                            h_tx, h_ty, h_dist, h_yaw, h_pitch = latest_head_features
+                        # Continuously log data points after 1.5s settle-down delay
+                        if is_tracking_active and point_captured_duration >= 1.5:
                             calibration_data.append((
                                 pt[0], pt[1], 
-                                latest_lh_ratio, latest_lv_ratio, latest_rh_ratio, latest_rv_ratio,
-                                h_tx, h_ty, h_dist, h_yaw, h_pitch
+                                latest_features[0], latest_features[1],
+                                latest_features[2], latest_features[3],
+                                latest_features[4], latest_features[5], latest_features[6]
                             ))
                     else:
                         # Faint uncalibrated points
@@ -601,22 +535,38 @@ while True:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (220, 220, 220), 2, cv2.LINE_AA)
 
     elif current_state == STATE_CALIBRATED:
+        # Draw 5 hollow Magenta validation rings (Center, Top-Left, Top-Right, Bottom-Left, Bottom-Right)
+        # to check calibration accuracy
+        v_margin_x = int(canvas_w * 0.1)
+        v_margin_y = int(canvas_h * 0.1)
+        v_mid_x = canvas_w // 2
+        v_mid_y = canvas_h // 2
+        validation_targets = [
+            ("Center", (v_mid_x, v_mid_y)),
+            ("Top-Left", (v_margin_x, v_margin_y)),
+            ("Top-Right", (canvas_w - v_margin_x, v_margin_y)),
+            ("Bottom-Left", (v_margin_x, canvas_h - v_margin_y)),
+            ("Bottom-Right", (canvas_w - v_margin_x, canvas_h - v_margin_y))
+        ]
+
+        for label, pt in validation_targets:
+            cv2.circle(canvas, pt, 20, (255, 0, 255), 2, cv2.LINE_AA)
+            cv2.circle(canvas, pt, 4, (255, 0, 255), -1, cv2.LINE_AA)
+            cv2.putText(canvas, label, (pt[0] - 30, pt[1] - 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
+
         # Predict gaze coordinate in real-time
-        if latest_lh_ratio is not None and latest_head_features is not None:
-            pred = predict_gaze(latest_lh_ratio, latest_lv_ratio, latest_rh_ratio, latest_rv_ratio, 
-                                latest_head_features, x_weights, y_weights, means, stds)
+        if latest_features is not None:
+            pred = predict_gaze(latest_features, x_weights, y_weights, means, stds)
             if pred is not None:
                 pred_x, pred_y = pred
-                pred_x = np.clip(pred_x, 0, canvas_w)
-                pred_y = np.clip(pred_y, 0, canvas_h)
+                pred_x = np.clip(pred_x, 0, canvas_w - 1)
+                pred_y = np.clip(pred_y, 0, canvas_h - 1)
 
-                # Smooth gaze predictions to reduce jitter
-                gaze_history.append((pred_x, pred_y))
-                if len(gaze_history) > HISTORY_SIZE:
-                    gaze_history.pop(0)
-
-                smooth_x = int(sum(pt[0] for pt in gaze_history) / len(gaze_history))
-                smooth_y = int(sum(pt[1] for pt in gaze_history) / len(gaze_history))
+                # Smooth gaze predictions with OneEuroFilter to reduce jitter
+                smooth_x, smooth_y = gaze_filter.filter(pred_x, pred_y, current_time)
+                smooth_x = int(np.clip(smooth_x, 0, canvas_w - 1))
+                smooth_y = int(np.clip(smooth_y, 0, canvas_h - 1))
 
                 # Draw gaze cursor overlay
                 cv2.circle(canvas, (smooth_x, smooth_y), 22, (0, 140, 255), 2, cv2.LINE_AA)
@@ -652,7 +602,7 @@ while True:
         if (current_state == STATE_CALIB_STATIONARY or current_state == STATE_CALIB_SHAKING) and not point_running:
             point_running = True
             point_captured_duration = 0.0
-            input_smoother.reset()
+            gaze_filter.reset()
             print(f"Starting Point {active_point_idx + 1} / 9 calibration.")
     elif key == ord('c') or key == ord('C'):
         if current_state == STATE_PREVIEW:
@@ -676,7 +626,7 @@ while True:
         stds = None
         point_running = False
         point_captured_duration = 0.0
-        gaze_history = []
+        gaze_filter.reset()
         print("Calibration reset.")
 
 
