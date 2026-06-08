@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 .env
 .vscode/
+
+# MediaPipe model files (downloaded automatically at runtime)
+*.task
